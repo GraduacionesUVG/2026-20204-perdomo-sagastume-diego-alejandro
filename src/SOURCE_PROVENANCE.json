@@ -1,0 +1,18 @@
+{
+  "repository": "https://github.com/DiegoPerdomo0805/AdaptiveDifficultyRogue",
+  "release_tag": "thesis-v1.0",
+  "release_commit": "f861e22d50c8a45fc5f4f133011da99b52d0a5df",
+  "frozen_commit": "22d398b142468949b0c8d0c032a09fd5f2d6686c",
+  "hybrid_execution_commit": "175de25424d3a3698312e7d3be0b49fa6069d817",
+  "excluded_release_paths": [
+    ".gitignore",
+    "human_sessions/",
+    "logs.txt",
+    "runs.csv"
+  ],
+  "local_additions": {
+    "closest_ood": "experiments/20261021_main/04_train_cgan/runs/s2_b128_lb10.0_ld1.0/candidates/epoch_0025/cgan_checkpoint.pt",
+    "best_balance": "experiments/20261021_main/04_train_cgan/runs/s2_b64_lb10.0_ld1.0/candidates/epoch_0045/cgan_checkpoint.pt"
+  },
+  "note": "Export of release plus hash-verified checkpoints; not original Git ancestry. Raw training data and human sessions not included."
+}

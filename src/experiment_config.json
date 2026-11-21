@@ -1,0 +1,172 @@
+{
+  "experiment_config_version": "exp_v3.2",
+  "status": "FROZEN: supersedes exp_v3.1 (kept in freeze_history/ and git). Design-intent targets and weights, pseudo-Huber capped-scale loss, run-level primary metric B_r, closed-loop checkpoint selection (mean(B_r) + 0.5*CVaR_0.90(B_r) on selection_validation rollouts; death <= 0.08, OOD excess <= 0.05, runtime guard <= 0.01, fallbacks <= 0.01), fixed_default, shared boss, collection mixtures, gates, split seeds, non-overlapping seed partitions, action-support limits and the 3-combat-room loot horizon are fixed for the principal collection (see experiment_freeze.json). exp_v3.1 datasets are never reused. Do not modify after collection starts.",
+
+  "enemy_controller": {
+    "fixed": {
+      "version": "fixed_default_v1",
+      "name": "fixed_default",
+      "action": {"enemy_hp_mult": 1.0, "enemy_dmg_mult": 1.0, "enemy_speed_mult": 1.0, "spawn_count": 2},
+      "provenance": "Canonical static configuration: neutral multipliers 1.0 (enemies use the documented base constants ENEMY_BASE_HP=30, ENEMY_BASE_DMG=6, ENEMY_SPEED=110) and spawn_count = DDA_SPAWN_BASE = 2, the documented base spawn count. A consistent historical static configuration for the current game could not be established: the ALPHA build (14bab89) used multipliers 1.0 with spawn_count 6 but different base stats (ENEMY_BASE_HP=42, ENEMY_BASE_DMG=9), and 301bf81 used ad-hoc test values (0.4/0.3/0.25/2). Not tuned on pilot outcomes."
+    },
+    "heuristic": {"version": "heuristic_rule_based_dda_v1.2"},
+    "exploration": {
+      "version": "exploration_v1",
+      "mixture": {"perturb": 0.70, "uniform": 0.20, "reference": 0.10},
+      "perturb_log_sigma": {"enemy_hp_mult": 0.25, "enemy_dmg_mult": 0.25, "enemy_speed_mult": 0.12},
+      "perturb_spawn_delta": [-2, -1, 0, 1, 2],
+      "uniform_spawn_range": [2, 8],
+      "reference_actions": [
+        {"enemy_hp_mult": 0.8, "enemy_dmg_mult": 0.7, "enemy_speed_mult": 0.9, "spawn_count": 2},
+        {"enemy_hp_mult": 1.5, "enemy_dmg_mult": 1.3, "enemy_speed_mult": 1.15, "spawn_count": 3},
+        {"enemy_hp_mult": 2.2, "enemy_dmg_mult": 1.8, "enemy_speed_mult": 1.4, "spawn_count": 5}
+      ]
+    },
+    "cgan": {"version": "cgan_outcome_guided_v2", "max_invalid_outputs": 3},
+    "non_combat_action": {"enemy_hp_mult": 1.0, "enemy_dmg_mult": 1.0, "enemy_speed_mult": 1.0, "spawn_count": 2}
+  },
+
+  "shared_boss": {
+    "version": "shared_boss_v1",
+    "description": "Deterministic boss policy shared by every experimental condition. The raw action below passes through dda_core.effective_applied_config (hp x4, dmg x1.7, speed x0.9, one boss). No enemy model is invoked in boss rooms.",
+    "raw_action": {"enemy_hp_mult": 1.5, "enemy_dmg_mult": 1.3, "enemy_speed_mult": 1.15, "spawn_count": 3}
+  },
+
+  "reward_policy": {
+    "fixed_uniform": {"version": "fixed_uniform_v1"},
+    "heuristic": {"version": "heuristic_loot_bias_v1"},
+    "exploration": {
+      "version": "loot_exploration_v1",
+      "mixture": {"focus": 0.60, "uniform": 0.20, "heuristic": 0.20},
+      "focus_mass": 0.70
+    },
+    "learned_loot": {"version": "learned_loot_v1", "max_invalid_outputs": 3, "fallback": "heuristic"},
+    "bot_selection": {"mechanism": "bot_uniform_offer_pick_v1",
+                      "description": "With the archetype's p_take_loot the bot picks one of the 3 offers uniformly at random, otherwise it takes nothing."}
+  },
+
+  "balance_loss": {
+    "shape": "pseudo_huber_capped_scale",
+    "description": "term_i = w_i * 2*(sqrt(1+(d/s)^2)-1) with d the distance outside the interval and s the configured scale capped, per side, at the distance between that interval bound and the physical limit; L = sum(term_i)/sum(w_i). Chosen to remove asymmetric scale artefacts and unbounded quadratic dominance (pre-freeze audit), not to favour any controller."
+  },
+
+  "primary_metric": {
+    "name": "run_level_ordinary_balance",
+    "description": "Per run, over ordinary combat rooms only (no boss, no non-combat rooms): death rate = deaths / rooms; post_hp = mean post-room HP ratio (0 for a fatal room); damage_share = sum(taken) / (sum(taken) + sum(dealt)); combat_efficiency = sum(kills) / max(sum(hits), 1); duration_norm = mean per-room min(t/30 s, 1). B_r = balance loss of that vector. Controllers are ranked by mean B_r across runs (run = experimental unit), with bootstrap CIs and matched-seed paired differences. Runs without ordinary combat rooms are excluded and counted."
+  },
+
+  "outcomes": {
+    "columns": ["death", "post_hp_ratio", "damage_share", "combat_efficiency", "duration_norm"],
+    "duration_norm_seconds": 30.0,
+    "duration_norm_cap": 1.0
+  },
+
+  "enemy_balance_targets": {
+    "death":             {"low": 0.0,  "high": 0.08, "scale": 0.10, "weight": 3.0},
+    "post_hp_ratio":     {"low": 0.35, "high": 0.85, "scale": 0.20, "weight": 2.0},
+    "damage_share":      {"low": 0.09, "high": 0.31, "scale": 0.12, "weight": 1.0},
+    "combat_efficiency": {"low": 0.15, "high": 0.50, "scale": 0.20, "weight": 0.5},
+    "duration_norm":     {"low": 0.10, "high": 0.50, "scale": 0.20, "weight": 0.5}
+  },
+
+  "loot_horizon": {
+    "combat_rooms": 3,
+    "columns": ["death_within", "end_hp_ratio", "damage_share", "combat_efficiency", "duration_norm_per_room"]
+  },
+
+  "loot_horizon_balance_targets": {
+    "death_within":           {"low": 0.0,  "high": 0.15, "scale": 0.15, "weight": 3.0},
+    "end_hp_ratio":           {"low": 0.35, "high": 0.85, "scale": 0.20, "weight": 2.0},
+    "damage_share":           {"low": 0.09, "high": 0.31, "scale": 0.12, "weight": 1.0},
+    "combat_efficiency":      {"low": 0.15, "high": 0.50, "scale": 0.20, "weight": 0.5},
+    "duration_norm_per_room": {"low": 0.10, "high": 0.50, "scale": 0.20, "weight": 0.5}
+  },
+
+  "enemy_action_support": {
+    "box_quantiles": [0.01, 0.99],
+    "knn_k": 10,
+    "knn_threshold_quantile": 0.95,
+    "lambda_support": 5.0,
+    "runtime_ood_factor": 1.5,
+    "reference_max_rows": 4000
+  },
+
+  "loot_action_support": {
+    "min_category_prob": 0.05,
+    "min_category_events": 30,
+    "lambda_entropy": 0.05,
+    "lambda_diversity": 0.5,
+    "diversity_tau": 0.02
+  },
+
+  "q_gate": {
+    "key_continuous_outputs": ["post_hp_ratio", "damage_share"],
+    "min_r2_vs_mean": 0.0,
+    "require_death_brier_below_prevalence": true,
+    "min_action_gain_rel": 0.02
+  },
+
+  "q_loot_gate": {
+    "min_reward_gain_rel": 0.01,
+    "require_beats_naive": true,
+    "split_seeds": [0, 1, 2],
+    "description": "Learned loot is trained only if a reward-aware Q_loot beats its information-matched state-only twin (x+c vs x, x+c+item+prior vs x+prior) on held-out runs by a MEAN aggregate-skill gain >= min_reward_gain_rel with a positive gain on EVERY grouped split in split_seeds, and beats the naive predictor on every split."
+  },
+
+  "cgan_training": {
+    "lambda_balance": 10.0,
+    "lambda_diversity": 1.0,
+    "description": "Defaults for train_cgan.py (CLI flags override and are recorded). lambda_balance=1 let the adversarial term pull G back toward the observed action distribution during the smoke pilot."
+  },
+
+  "cgan_selection": {
+    "closed_loop": {
+      "description": "Final checkpoint selection uses OBSERVED closed-loop bot rollouts, never Q predictions. Candidate filtering: every candidate_every_epochs epochs, an epoch that passes the room-level gates (validity, min_diversity, min_sensitivity, min_epoch) becomes a candidate; after training the top_k_candidates by room-level selection score are saved through the normal checkpoint path, reloaded through model_runtime (compatibility validation) and rolled out on the frozen validation seeds (first n_runs seeds of seed_blocks.selection_validation, enemy controller = the candidate, reward policy = reward_policy, shared boss). selection_score = mean(B_r) + cvar_coef * CVaR_alpha(B_r); lower is better. CVaR_alpha = mean of the worst ceil((1-alpha)*n) run-level B_r values. Eligible only if: room-level validity/diversity/sensitivity gates pass, every validation action is valid, observed ordinary-room death rate <= max_ordinary_death_rate, every fallback is recorded and is an OOD-guard fallback, the checkpoint reloads through model_runtime, ood_excess <= max_ood_excess, runtime_guard_rate <= max_runtime_guard_rate and fallback_rate <= max_fallback_rate. OOD decomposition (post hoc on the logged rows, never altering the rollout): for every ordinary-room state reached by the candidate, the support ratio (kNN distance / training threshold) of the candidate's generated action and of the heuristic (rule_based_dda) counterfactual action for exactly the same state; cgan_ood_rate and heuristic_same_state_ood_rate are the shares with ratio > 1, ood_excess = cgan_ood_rate - heuristic_same_state_ood_rate (not clipped), runtime_guard_rate = share of generated actions with ratio > enemy_action_support.runtime_ood_factor. The absolute cGAN OOD rate is a diagnostic, not a gate. If no candidate is eligible, selection fails and no checkpoint is produced.",
+      "validation_seed_block": "selection_validation",
+      "n_runs": 200,
+      "reward_policy": "heuristic",
+      "cvar_alpha": 0.90,
+      "cvar_coef": 0.5,
+      "max_ordinary_death_rate": 0.08,
+      "max_ood_excess": 0.05,
+      "max_runtime_guard_rate": 0.01,
+      "max_fallback_rate": 0.01,
+      "candidate_every_epochs": 5,
+      "top_k_candidates": 6
+    },
+    "min_epoch": 10,
+    "min_diversity": 0.01,
+    "min_sensitivity": 0.01,
+    "w_invalid": 10.0,
+    "w_diversity": 0.5,
+    "diversity_cap": 0.10,
+    "w_sensitivity": 0.5,
+    "sensitivity_cap": 0.10,
+    "w_jitter": 0.25,
+    "w_ood": 2.0,
+    "diversity_samples": 8
+  },
+
+  "calibration_rule": {
+    "description": "Pre-specified, controller-agnostic proposal rule: continuous targets = [q25, q75] of the POOLED pilot outcomes of all collection policies; death targets keep the design ceiling. The rule never looks at which controller performs best.",
+    "continuous_quantiles": [0.25, 0.75]
+  },
+
+  "principal_collection": {
+    "enemy_controller_mix": "exploration=0.65,heuristic=0.20,fixed=0.15",
+    "reward_policy_mix": "exploration=0.60,heuristic=0.20,fixed_uniform=0.20",
+    "learned_loot_allowed": false,
+    "target_combat_rooms": 30000,
+    "description": "Documented collection mixtures (per-run assignment by seeded draw). learned_loot is never used during collection; it may be trained afterwards only if the predefined Q_loot gate passes on the principal data."
+  },
+
+  "seed_blocks": {
+    "pilot": [100000, 199999],
+    "train_collection": [1000000, 4999999],
+    "selection_validation": [8000000, 8999999],
+    "used_in_pilot_smoke_evaluations": [9000000, 9099999],
+    "smoke_test": [9100000, 9199999],
+    "final_test": [9500000, 9999999],
+    "description": "Non-overlapping partitions. train_collection: data for Q/G/D and Q_loot. selection_validation: closed-loop checkpoint selection only. final_test: the final controller comparison only -- never used to train, tune, select epochs/checkpoints or change targets. smoke_test: pre-freeze smoke comparisons. used_in_pilot_smoke_evaluations: consumed by exp_v2/v3.1 smoke evaluations, never used again."
+  }
+}

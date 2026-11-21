@@ -1,0 +1,348 @@
+# --- DEPRECATED (cGAN_vs_heuristic) ------------------------------------------
+# Legacy 6-feature run-level cGAN trained on runs.csv by heuristic reconstruction.
+# It is NOT part of the final experiment. The authoritative pipeline is the
+# root bot_runner.py -> train_q.py -> train_cgan.py -> evaluate_controllers.py
+# (see README.md). Set ROGUE_ALLOW_LEGACY=1 only to reopen historical material.
+import os as _os
+import sys as _sys
+if __name__ == "__main__" and _os.environ.get("ROGUE_ALLOW_LEGACY") != "1":
+    _sys.exit("cGAN.py is DEPRECATED legacy code (6-dim run-level schema, heuristic-imitation objective). Use the root pipeline "
+              "described in README.md. Set ROGUE_ALLOW_LEGACY=1 to override.")
+if __name__ != "__main__" and _os.environ.get("ROGUE_ALLOW_LEGACY") != "1":
+    raise ImportError("cGAN.py is DEPRECATED legacy code and must not be imported "
+                      "by the active pipeline. Set ROGUE_ALLOW_LEGACY=1 to override.")
+# ---------------------------------------------------------------------------
+
+import os
+import argparse
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset, random_split
+
+# Single source of truth for the 6-dim feature vector (see dda_core.py) —
+# this used to be a third independent reimplementation of the same formula
+# used in rogue.py and train_cgan.py.
+import dda_core
+
+
+# ----------------------------
+# Conditioning vector = your thesis metrics
+# ----------------------------
+def build_features(df: pd.DataFrame) -> np.ndarray:
+    """Row-wise delegate to dda_core.feature_vector_from_raw(). A Python loop
+    over a few thousand rows is negligible next to GAN training time, and it
+    guarantees this can never silently drift from rogue.py's live feature
+    computation the way the old hand-vectorised version could."""
+    rows = [
+        dda_core.feature_vector_from_raw(
+            r.melee_kills, r.magic_kills, r.melee_hits, r.magic_hits,
+            r.damage_taken, r.damage_dealt, r.deaths, r.time_alive,
+        )
+        for r in df.itertuples(index=False)
+    ]
+    return np.asarray(rows, dtype=np.float32)
+
+
+# ----------------------------
+# Targets to generate (content tuning vector)
+# ----------------------------
+def build_targets(df: pd.DataFrame) -> np.ndarray:
+    # y = [enemy_hp_mult, enemy_dmg_mult, enemy_speed_mult, spawn_count_norm]
+    hp = df["enemy_hp_mult"].to_numpy(dtype=np.float32)
+    dmg = df["enemy_dmg_mult"].to_numpy(dtype=np.float32)
+    spd = df["enemy_speed_mult"].to_numpy(dtype=np.float32)
+    spawn = df["spawn_count"].to_numpy(dtype=np.float32)
+
+    # normalize spawn to 0..1 (assume 1..12 typical)
+    spawn_norm = np.clip((spawn - 1.0) / 11.0, 0.0, 1.0)
+
+    # clamp multipliers to sane training ranges
+    hp = np.clip(hp, 0.5, 3.0)
+    dmg = np.clip(dmg, 0.5, 3.0)
+    spd = np.clip(spd, 0.5, 2.5)
+
+    # scale to 0..1 for sigmoid generator convenience
+    # these min/max must match runtime decode
+    hp01 = (hp - 0.5) / (3.0 - 0.5)
+    dmg01 = (dmg - 0.5) / (3.0 - 0.5)
+    spd01 = (spd - 0.5) / (2.5 - 0.5)
+
+    Y = np.stack([hp01, dmg01, spd01, spawn_norm], axis=1).astype(np.float32)
+    return Y
+
+
+# ----------------------------
+# Loot bias targets derived from archetype labels.
+#
+# Shape: [weapon_w, spell_w, armor_w, boots_w]  (softmax-ready weights)
+# These are NOT learned from gameplay data (there is no loot feedback signal
+# in runs.csv). Instead we define archetype-specific target distributions and
+# train LootGenerator to reproduce them conditioned on the same archetype
+# soft-vector the difficulty GAN already uses.
+#
+# Archetype → preferred item categories:
+#   0 Knight   : weapon > armor > boots >> spell
+#   1 Berserker: armor > weapon > boots >> spell   (survives by being tanky)
+#   2 Sniper   : spell > boots > armor >> weapon
+# ----------------------------
+# Loot weight targets per archetype (unnormalised; softmax at runtime).
+# Pulled from dda_core so this table can never drift from the one
+# rule_based_dda() uses live in rogue.py/bot_runner.py.
+LOOT_TARGETS_BY_ARCHETYPE = np.array([
+    dda_core.LOOT_BIAS_KNIGHT,     # 0 Knight
+    dda_core.LOOT_BIAS_BERSERKER,  # 1 Berserker
+    dda_core.LOOT_BIAS_SNIPER,     # 2 Sniper
+], dtype=np.float32)
+
+
+def build_loot_targets(labels: np.ndarray) -> np.ndarray:
+    """Return per-sample loot weight targets based on archetype label."""
+    return LOOT_TARGETS_BY_ARCHETYPE[labels]
+
+
+# ----------------------------
+# Archetype classifier (simple, learned from labels derived from behavior)
+# ----------------------------
+def derive_archetype_labels(X: np.ndarray) -> np.ndarray:
+    """
+    Essentials-first: pseudo-labels from heuristics.
+    Later: replace with actual user-study labels or clustering.
+    Labels:
+      0 Knight-ish: melee heavy + low dmg_ratio
+      1 Berserker-ish: melee heavy + high dmg_ratio + higher death_rate
+      2 Spell Sniper-ish: magic heavy
+    """
+    melee_ratio = X[:, 0]
+    magic_ratio = X[:, 1]
+    dmg_ratio = X[:, 4]
+    death_rate = X[:, 5]
+
+    labels = np.zeros(len(X), dtype=np.int64)
+    labels[magic_ratio > 0.6] = 2
+    labels[(melee_ratio > 0.6) & (dmg_ratio > 1.2) & (death_rate > 0.3)] = 1
+    return labels
+
+
+class ArchetypeClassifier(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(6, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU(),
+            nn.Linear(16, 3),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
+# ----------------------------
+# cGAN — difficulty
+# ----------------------------
+class Generator(nn.Module):
+    def __init__(self, noise_dim=10, cond_dim=3, out_dim=4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(noise_dim + cond_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, out_dim),
+            nn.Sigmoid(),  # outputs in 0..1
+        )
+
+    def forward(self, z, c):
+        return self.net(torch.cat([z, c], dim=1))
+
+
+class Discriminator(nn.Module):
+    def __init__(self, in_dim=4, cond_dim=3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim + cond_dim, 64),
+            nn.LeakyReLU(0.2),
+            nn.Linear(64, 64),
+            nn.LeakyReLU(0.2),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, y, c):
+        return self.net(torch.cat([y, c], dim=1))
+
+
+# ----------------------------
+# LootGenerator — item category bias
+#
+# Maps (noise, archetype_soft_vec) → 4D loot weight vector (sigmoid).
+# Trained with MSE against archetype-derived target distributions; no
+# discriminator needed — the targets are deterministic per archetype so
+# a plain regressor is sufficient and stabler than a second GAN.
+# ----------------------------
+class LootGenerator(nn.Module):
+    """
+    Produces a 4-dim weight vector [weapon_w, spell_w, armor_w, boots_w].
+    Sigmoid outputs live in (0, 1); pass through softmax at runtime to get
+    a proper categorical distribution for weighted sampling.
+    """
+    def __init__(self, noise_dim=8, cond_dim=3, out_dim=4):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(noise_dim + cond_dim, 32),
+            nn.ReLU(),
+            nn.Linear(32, 32),
+            nn.ReLU(),
+            nn.Linear(32, out_dim),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, z, c):
+        return self.net(torch.cat([z, c], dim=1))
+
+
+def one_hot(labels: torch.Tensor, n=3) -> torch.Tensor:
+    return torch.eye(n, device=labels.device)[labels]
+
+
+def train_models(df: pd.DataFrame, out_dir: str, epochs: int = 80, batch_size: int = 64, device: str = "cpu"):
+    X = build_features(df)
+    Y = build_targets(df)
+    labels = derive_archetype_labels(X)
+    Y_loot = build_loot_targets(labels)
+
+    X_t      = torch.tensor(X,      dtype=torch.float32, device=device)
+    Y_t      = torch.tensor(Y,      dtype=torch.float32, device=device)
+    L_t      = torch.tensor(labels, dtype=torch.long,    device=device)
+    YL_t     = torch.tensor(Y_loot, dtype=torch.float32, device=device)
+
+    dataset = TensorDataset(X_t, Y_t, L_t, YL_t)
+    n_train = int(0.85 * len(dataset))
+    train_set, val_set = random_split(dataset, [n_train, len(dataset) - n_train])
+
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, drop_last=True)
+    val_loader   = DataLoader(val_set,   batch_size=batch_size, shuffle=False)
+
+    # ------------------------------------------------------------------
+    # 1) Archetype classifier
+    # ------------------------------------------------------------------
+    clf = ArchetypeClassifier().to(device)
+    opt_c = optim.Adam(clf.parameters(), lr=1e-3)
+    ce = nn.CrossEntropyLoss()
+
+    for ep in range(25):
+        clf.train()
+        for xb, _, lb, _ in train_loader:
+            logits = clf(xb)
+            loss = ce(logits, lb)
+            opt_c.zero_grad()
+            loss.backward()
+            opt_c.step()
+
+    clf.eval()
+    print("Classifier trained.")
+
+    # ------------------------------------------------------------------
+    # 2) Difficulty cGAN
+    # ------------------------------------------------------------------
+    G = Generator().to(device)
+    D = Discriminator().to(device)
+    opt_g = optim.Adam(G.parameters(), lr=2e-4, betas=(0.5, 0.999))
+    opt_d = optim.Adam(D.parameters(), lr=2e-4, betas=(0.5, 0.999))
+    bce = nn.BCELoss()
+
+    for ep in range(epochs):
+        G.train(); D.train()
+        for xb, yb, _, _ in train_loader:
+            with torch.no_grad():
+                c_logits = clf(xb)
+                c = torch.softmax(c_logits, dim=1)  # soft archetype condition (3)
+
+            bs = xb.size(0)
+            real = torch.ones(bs, 1, device=device)
+            fake = torch.zeros(bs, 1, device=device)
+
+            # D step
+            z = torch.randn(bs, 10, device=device)
+            y_fake = G(z, c).detach()
+            d_real = D(yb, c)
+            d_fake = D(y_fake, c)
+            loss_d = bce(d_real, real) + bce(d_fake, fake)
+            opt_d.zero_grad()
+            loss_d.backward()
+            opt_d.step()
+
+            # G step
+            z = torch.randn(bs, 10, device=device)
+            y_gen = G(z, c)
+            d_gen = D(y_gen, c)
+            loss_g = bce(d_gen, real)
+            opt_g.zero_grad()
+            loss_g.backward()
+            opt_g.step()
+
+        if ep % 10 == 0 or ep == epochs - 1:
+            print(f"[DiffGAN] Epoch {ep:03d} | D {loss_d.item():.4f} | G {loss_g.item():.4f}")
+
+    # ------------------------------------------------------------------
+    # 3) Loot generator (MSE regression against archetype loot targets)
+    #
+    # We do NOT need a discriminator here — the loot target distribution is
+    # fully determined by the archetype label, so a conditional regressor
+    # converges cleanly and avoids GAN instability for this sub-task.
+    # ------------------------------------------------------------------
+    LG = LootGenerator().to(device)
+    opt_lg = optim.Adam(LG.parameters(), lr=1e-3)
+    mse = nn.MSELoss()
+
+    loot_epochs = max(40, epochs // 2)
+    for ep in range(loot_epochs):
+        LG.train()
+        for xb, _, _, ylb in train_loader:
+            with torch.no_grad():
+                c_logits = clf(xb)
+                c = torch.softmax(c_logits, dim=1)
+
+            bs = xb.size(0)
+            z  = torch.randn(bs, 8, device=device)
+            loot_pred = LG(z, c)
+            loss_lg = mse(loot_pred, ylb)
+            opt_lg.zero_grad()
+            loss_lg.backward()
+            opt_lg.step()
+
+        if ep % 10 == 0 or ep == loot_epochs - 1:
+            print(f"[LootGen] Epoch {ep:03d} | MSE {loss_lg.item():.5f}")
+
+    # ------------------------------------------------------------------
+    # Save all three models
+    # ------------------------------------------------------------------
+    os.makedirs(out_dir, exist_ok=True)
+    torch.save(clf.state_dict(), os.path.join(out_dir, "classifier.pt"))
+    torch.save(G.state_dict(),   os.path.join(out_dir, "generator.pt"))
+    torch.save(LG.state_dict(),  os.path.join(out_dir, "loot_generator.pt"))
+    print("Saved to:", out_dir)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data",   required=True, help="CSV produced by rogue.py (runs.csv)")
+    ap.add_argument("--out",    default="models", help="output dir for .pt weights")
+    ap.add_argument("--epochs", type=int, default=80)
+    ap.add_argument("--batch",  type=int, default=64)
+    args = ap.parse_args()
+
+    df = pd.read_csv(args.data)
+    if len(df) < 200:
+        print(f"[WARN] Only {len(df)} rows. GANs like data. "
+              f"Expect mediocre outputs until you log more runs.")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    train_models(df, args.out, epochs=args.epochs, batch_size=args.batch, device=device)
+
+if __name__ == "__main__":
+    main()
